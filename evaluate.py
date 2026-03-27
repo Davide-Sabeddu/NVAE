@@ -14,6 +14,7 @@ from time import time
 
 from torch.multiprocessing import Process
 from torch.cuda.amp import autocast
+import torchvision.utils as vutils
 
 from model import AutoEncoder
 import utils
@@ -41,7 +42,7 @@ def main(eval_args):
     # load a checkpoint
     logging.info('loading the model at:')
     logging.info(eval_args.checkpoint)
-    checkpoint = torch.load(eval_args.checkpoint, map_location='cpu')
+    checkpoint = torch.load(eval_args.checkpoint, map_location='cpu', weights_only=False)
     args = checkpoint['args']
 
     if not hasattr(args, 'ada_groups'):
@@ -99,37 +100,99 @@ def main(eval_args):
         logging.info('fid is %f' % fid)
     else:
         bn_eval_mode = not eval_args.readjust_bn
-        total_samples = 50000 // eval_args.world_size          # num images per gpu
+        total_samples = 5000 // eval_args.world_size          # num images per gpu
         num_samples = 100                                      # sampling batch size
         num_iter = int(np.ceil(total_samples / num_samples))   # num iterations per gpu
 
-        with torch.no_grad():
-            n = int(np.floor(np.sqrt(num_samples)))
-            set_bn(model, bn_eval_mode, num_samples=16, t=eval_args.temp, iter=500)
-            for ind in range(num_iter):     # sampling is repeated.
-                torch.cuda.synchronize()
-                start = time()
-                with autocast():
-                    logits = model.sample(num_samples, eval_args.temp)
-                output = model.decoder_output(logits)
-                output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) \
-                    else output.sample()
-                torch.cuda.synchronize()
-                end = time()
-                logging.info('sampling time per batch: %0.3f sec', (end - start))
+    with torch.no_grad():
+        set_bn(model, bn_eval_mode, num_samples=16, t=eval_args.temp, iter=500)
 
-                visualize = False
-                if visualize:
-                    output_tiled = utils.tile_image(output_img, n).cpu().numpy().transpose(1, 2, 0)
-                    output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
-                    output_tiled = np.squeeze(output_tiled)
+        fig_dir = os.path.join(eval_args.save, "fig")
+        os.makedirs(fig_dir, exist_ok=True)
 
-                    plt.imshow(output_tiled)
-                    plt.show()
-                else:
-                    file_path = os.path.join(eval_args.save, 'gpu_%d_samples_%d.npz' % (eval_args.local_rank, ind))
-                    np.savez_compressed(file_path, samples=output_img.cpu().numpy())
-                    logging.info('Saved at: {}'.format(file_path))
+        # ----------------------------------------
+        # 1. Generate samples (16x16 grid = 256)
+        # ----------------------------------------
+        num_gen = 256
+        nrow = 16
+
+        with autocast():
+            logits = model.sample(num_gen, eval_args.temp)
+
+        output = model.decoder_output(logits)
+        gen = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) \
+            else output.sample()
+
+        gen = gen.clamp(0, 1)
+
+        gen_path = os.path.join(fig_dir, "generated.png")
+
+        vutils.save_image(
+            gen,
+            gen_path,
+            nrow=nrow,
+            padding=1,
+            normalize=True
+        )
+
+        logging.info(f"Saved generated samples to: {gen_path}")
+
+        # ----------------------------------------
+        # 2. Build validation pool (5000 samples)
+        # ----------------------------------------
+        args.data = eval_args.data
+        train_queue, _, _ = datasets.get_loaders(args)
+
+        val_imgs = []
+        count = 0
+
+        for x, _ in train_queue:
+            val_imgs.append(x)
+            count += x.size(0)
+            if count >= 5000:
+                break
+
+        x_val = torch.cat(val_imgs, dim=0)[:5000].cuda()
+        x_val = x_val.clamp(0, 1)
+
+        logging.info(f"Validation pool size: {x_val.shape[0]}")
+
+        # ----------------------------------------
+        # 3. Flatten for distance computation
+        # ----------------------------------------
+        gen_flat = gen.view(gen.size(0), -1)
+        val_flat = x_val.view(x_val.size(0), -1)
+
+        # ----------------------------------------
+        # 4. Nearest neighbor search
+        # ----------------------------------------
+        dists = torch.cdist(gen_flat, val_flat, p=2)
+        nn_idx = torch.argmin(dists, dim=1)
+        nearest = x_val[nn_idx]
+
+        # ----------------------------------------
+        # 5. Build comparison grid
+        # [gen0, nn0, gen1, nn1, ...]
+        # ----------------------------------------
+        comparison = torch.empty(
+            (num_gen * 2, *gen.shape[1:]),
+            device=gen.device
+        )
+
+        comparison[0::2] = gen
+        comparison[1::2] = nearest
+
+        nn_path = os.path.join(fig_dir, "gen_vs_nearest.png")
+
+        vutils.save_image(
+            comparison,
+            nn_path,
+            nrow=32,   # 16 pairs per row
+            padding=2,
+            normalize=True
+        )
+
+        logging.info(f"Saved comparison grid to: {nn_path}")
 
 
 if __name__ == '__main__':

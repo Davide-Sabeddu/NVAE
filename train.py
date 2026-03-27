@@ -332,8 +332,7 @@ def cleanup():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('encoder decoder examiner')
     # experimental results
-    parser.add_argument('--root', type=str, default='/tmp/nasvae/expr',
-                        help='location of the results')
+    parser.add_argument('--root', type=str, default='./data')
     parser.add_argument('--save', type=str, default='exp',
                         help='id used for storing intermediate results')
     # data
