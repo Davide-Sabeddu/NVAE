@@ -24,6 +24,22 @@ from fid.fid_score import compute_statistics_of_generator, load_statistics, calc
 from fid.inception import InceptionV3
 
 
+def save_checkpoint(path, epoch, model, cnn_optimizer, grad_scalar, cnn_scheduler,
+                    global_step, args, arch_instance, metrics_history):
+    """Save a full checkpoint including metrics history."""
+    torch.save({
+        'epoch': epoch + 1,
+        'state_dict': model.state_dict(),
+        'optimizer': cnn_optimizer.state_dict(),
+        'grad_scalar': grad_scalar.state_dict(),
+        'scheduler': cnn_scheduler.state_dict(),
+        'global_step': global_step,
+        'args': args,
+        'arch_instance': arch_instance,
+        'metrics_history': metrics_history,   # <-- NEW: full metrics log
+    }, path)
+
+
 def main(args):
     # ensures that weight initializations are all the same
     torch.manual_seed(args.seed)
@@ -50,7 +66,6 @@ def main(args):
     logging.info('groups per scale: %s, total_groups: %d', model.groups_per_scale, sum(model.groups_per_scale))
 
     if args.fast_adamax:
-        # Fast adamax has the same functionality as torch.optim.Adamax, except it is faster.
         cnn_optimizer = Adamax(model.parameters(), args.learning_rate,
                                weight_decay=args.weight_decay, eps=1e-3)
     else:
@@ -64,10 +79,24 @@ def main(args):
     num_output = utils.num_output(args.dataset)
     bpd_coeff = 1. / np.log(2.) / num_output
 
-    # if load
+    # Metrics history: persisted across restarts so nothing is lost.
+    # Each entry is a (step_or_epoch, value) tuple so TensorBoard axes stay correct.
+    metrics_history = {
+        'train_nelbo': [],       # (global_step, value)
+        'valid_nelbo': [],       # (epoch, value)
+        'valid_neg_log_p': [],   # (epoch, value)
+        'valid_bpd_elbo': [],    # (epoch, value)
+        'valid_bpd_log_p': [],   # (epoch, value)
+    }
+
+    # ------------------------------------------------------------------ #
+    #  Checkpoint loading                                                  #
+    # ------------------------------------------------------------------ #
+    # "checkpoint.pt" is the rolling latest checkpoint (always up-to-date).
+    # Epoch-stamped files like "checkpoint_42.pth" are kept for rollback.
     checkpoint_file = os.path.join(args.save, 'checkpoint.pt')
     if args.cont_training:
-        logging.info('loading the model.')
+        logging.info('loading the model from %s', checkpoint_file)
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
         init_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
@@ -76,11 +105,35 @@ def main(args):
         grad_scalar.load_state_dict(checkpoint['grad_scalar'])
         cnn_scheduler.load_state_dict(checkpoint['scheduler'])
         global_step = checkpoint['global_step']
+
+        # Restore metrics history so future plots are continuous
+        if 'metrics_history' in checkpoint:
+            metrics_history = checkpoint['metrics_history']
+            logging.info('restored metrics history (%d train entries, %d val entries)',
+                         len(metrics_history['train_nelbo']),
+                         len(metrics_history['valid_nelbo']))
+
+            # Re-emit all past scalars to TensorBoard so graphs are unbroken.
+            # TensorBoard deduplicates by step, so replaying is safe.
+            for step, val in metrics_history['train_nelbo']:
+                writer.add_scalar('train/nelbo', val, step)
+            for ep, val in metrics_history['valid_nelbo']:
+                writer.add_scalar('val/nelbo', val, ep)
+            for ep, val in metrics_history['valid_neg_log_p']:
+                writer.add_scalar('val/neg_log_p', val, ep)
+            for ep, val in metrics_history['valid_bpd_elbo']:
+                writer.add_scalar('val/bpd_elbo', val, ep)
+            for ep, val in metrics_history['valid_bpd_log_p']:
+                writer.add_scalar('val/bpd_log_p', val, ep)
+        else:
+            logging.info('checkpoint has no metrics_history (old format) — starting fresh metrics log.')
     else:
         global_step, init_epoch = 0, 0
 
+    # ------------------------------------------------------------------ #
+    #  Training loop                                                       #
+    # ------------------------------------------------------------------ #
     for epoch in range(init_epoch, args.epochs):
-        # update lrs.
         if args.distributed:
             train_queue.sampler.set_epoch(global_step + args.seed)
             valid_queue.sampler.set_epoch(0)
@@ -88,16 +141,17 @@ def main(args):
         if epoch > args.warmup_epochs:
             cnn_scheduler.step()
 
-        # Logging.
         logging.info('epoch %d', epoch)
 
-        # Training.
-        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
+        train_nelbo, global_step = train(train_queue, model, cnn_optimizer, grad_scalar,
+                                         global_step, warmup_iters, writer, logging)
         logging.info('train_nelbo %f', train_nelbo)
+
+        # Record and write train metric
+        metrics_history['train_nelbo'].append((global_step, float(train_nelbo)))
         writer.add_scalar('train/nelbo', train_nelbo, global_step)
 
         model.eval()
-        # generate samples less frequently
         eval_freq = 1 if args.epochs <= 50 else 20
         if epoch % eval_freq == 0 or epoch == (args.epochs - 1):
             with torch.no_grad():
@@ -115,24 +169,49 @@ def main(args):
             logging.info('valid neg log p %f', valid_neg_log_p)
             logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
             logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
+
+            # Record val metrics
+            metrics_history['valid_nelbo'].append((epoch, float(valid_nelbo)))
+            metrics_history['valid_neg_log_p'].append((epoch, float(valid_neg_log_p)))
+            metrics_history['valid_bpd_elbo'].append((epoch, float(valid_nelbo * bpd_coeff)))
+            metrics_history['valid_bpd_log_p'].append((epoch, float(valid_neg_log_p * bpd_coeff)))
+
             writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch)
             writer.add_scalar('val/nelbo', valid_nelbo, epoch)
             writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
             writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
 
+        # -------------------------------------------------------------- #
+        #  Checkpoint saving                                               #
+        # -------------------------------------------------------------- #
         save_freq = int(np.ceil(args.epochs / 100))
         if epoch % save_freq == 0 or epoch == (args.epochs - 1):
             if args.global_rank == 0:
                 logging.info('saving the model.')
-                epoch_checkpoint_file = os.path.join(args.save, f'checkpoint_{epoch}.pth')
-                torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
-                            'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
-                            'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
-                            'grad_scalar': grad_scalar.state_dict()}, epoch_checkpoint_file)
+
+                # 1. Epoch-stamped snapshot (kept permanently for rollback)
+                epoch_ckpt = os.path.join(args.save, f'checkpoint_{epoch}.pth')
+                save_checkpoint(epoch_ckpt, epoch, model, cnn_optimizer,
+                                grad_scalar, cnn_scheduler, global_step, args,
+                                arch_instance, metrics_history)
+
+                # 2. Rolling latest checkpoint — this is what --cont_training reads.
+                #    Written after the epoch snapshot so a crash mid-write doesn't
+                #    corrupt the only copy.
+                save_checkpoint(checkpoint_file, epoch, model, cnn_optimizer,
+                                grad_scalar, cnn_scheduler, global_step, args,
+                                arch_instance, metrics_history)
+
     # Final validation
     valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
     logging.info('final valid nelbo %f', valid_nelbo)
     logging.info('final valid neg log p %f', valid_neg_log_p)
+
+    metrics_history['valid_nelbo'].append((args.epochs, float(valid_nelbo)))
+    metrics_history['valid_neg_log_p'].append((args.epochs, float(valid_neg_log_p)))
+    metrics_history['valid_bpd_elbo'].append((args.epochs, float(valid_nelbo * bpd_coeff)))
+    metrics_history['valid_bpd_log_p'].append((args.epochs, float(valid_neg_log_p * bpd_coeff)))
+
     writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
     writer.add_scalar('val/nelbo', valid_nelbo, epoch + 1)
     writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
@@ -149,16 +228,13 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
 
-        # change bit length
         x = utils.pre_process(x, args.num_x_bits)
 
-        # warm-up lr
         if global_step < warmup_iters:
             lr = args.learning_rate * float(global_step) / warmup_iters
             for param_group in cnn_optimizer.param_groups:
                 param_group['lr'] = lr
 
-        # sync parameters, it may not be necessary
         if step % 100 == 0:
             utils.average_params(model.parameters(), args.distributed)
 
@@ -177,7 +253,6 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
             loss = torch.mean(nelbo_batch)
             norm_loss = model.spectral_norm_parallel()
             bn_loss = model.batchnorm_loss()
-            # get spectral regularization coefficient (lambda)
             if args.weight_decay_norm_anneal:
                 assert args.weight_decay_norm_init > 0 and args.weight_decay_norm > 0, 'init and final wdn should be positive.'
                 wdn_coeff = (1. - kl_coeff) * np.log(args.weight_decay_norm_init) + kl_coeff * np.log(args.weight_decay_norm)
@@ -194,7 +269,7 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
         nelbo.update(loss.data, 1)
 
         if (global_step + 1) % 100 == 0:
-            if (global_step + 1) % 1000 == 0:  # reduced frequency
+            if (global_step + 1) % 1000 == 0:
                 n = int(np.floor(np.sqrt(x.size(0))))
                 x_img = x[:n*n]
                 output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample()
@@ -204,7 +279,6 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 in_out_tiled = torch.cat((x_tiled, output_tiled), dim=2)
                 writer.add_image('reconstruction', in_out_tiled, global_step)
 
-            # norm
             writer.add_scalar('train/norm_loss', norm_loss, global_step)
             writer.add_scalar('train/bn_loss', bn_loss, global_step)
             writer.add_scalar('train/norm_coeff', wdn_coeff, global_step)
@@ -224,7 +298,6 @@ def train(train_queue, model, cnn_optimizer, grad_scalar, global_step, warmup_it
                 num_active = torch.sum(kl_diag_i > 0.1).detach()
                 total_active += num_active
 
-                # kl_ceoff
                 writer.add_scalar('kl/active_%d' % i, num_active, global_step)
                 writer.add_scalar('kl_coeff/layer_%d' % i, kl_coeffs[i], global_step)
                 writer.add_scalar('kl_vals/layer_%d' % i, kl_vals[i], global_step)
@@ -246,7 +319,6 @@ def test(valid_queue, model, num_samples, args, logging):
         x = x[0] if len(x) > 1 else x
         x = x.cuda()
 
-        # change bit length
         x = utils.pre_process(x, args.num_x_bits)
 
         with torch.no_grad():
@@ -269,7 +341,6 @@ def test(valid_queue, model, num_samples, args, logging):
     utils.average_tensor(nelbo_avg.avg, args.distributed)
     utils.average_tensor(neg_log_p_avg.avg, args.distributed)
     if args.distributed:
-        # block to sync
         dist.barrier()
     logging.info('val, step: %d, NELBO: %f, neg Log p %f', step, nelbo_avg.avg, neg_log_p_avg.avg)
     return neg_log_p_avg.avg, nelbo_avg.avg
@@ -296,18 +367,14 @@ def test_vae_fid(model, args, total_fid_samples):
     model = InceptionV3([block_idx], model_dir=args.fid_dir).to(device)
     m, s = compute_statistics_of_generator(g, model, args.batch_size, dims, device, max_samples=num_sample_per_gpu)
 
-    # share m and s
     m = torch.from_numpy(m).cuda()
     s = torch.from_numpy(s).cuda()
-    # take average across gpus
     utils.average_tensor(m, args.distributed)
     utils.average_tensor(s, args.distributed)
 
-    # convert m, s
     m = m.cpu().numpy()
     s = s.cpu().numpy()
 
-    # load precomputed m, s
     path = os.path.join(args.fid_dir, args.dataset + '.npz')
     m0, s0 = load_statistics(path)
 
@@ -454,9 +521,6 @@ if __name__ == '__main__':
         for p in processes:
             p.join()
     else:
-        # for debugging
         print('starting in debug mode')
         args.distributed = True
         init_processes(0, size, main, args)
-
-
