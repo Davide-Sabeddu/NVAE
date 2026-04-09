@@ -1,0 +1,75 @@
+{
+  "_comment": "NVAE",
+
+  "experiment_name": "nvae_cifar",
+  "phase": "train",
+
+  "__io__": "──────────────────────────────────────────",
+  "root":    "./data",
+  "save":    "nvae_cifar10",
+  "data":    "/home/da389032/datasets/cifar10",
+  "fid_dir": "/home/da389032/fid_stats",
+
+  "__data__": "──────────────────────────────────────────",
+  "dataset":    "cifar10",
+  "num_x_bits": 8,
+
+  "__optimisation__": "──────────────────────────────────────────",
+  "batch_size":               64,
+  "learning_rate":            0.01,
+  "learning_rate_min":        0.0001,
+  "weight_decay":             0.0003,
+  "weight_decay_norm":        0.01,
+  "weight_decay_norm_init":   10.0,
+  "weight_decay_norm_anneal": false,
+  "epochs":                   400,
+  "warmup_epochs":            5,
+  "fast_adamax":              true,
+  "arch_instance":            "res_mbconv",
+  "seed":                     1,
+  "cont_training":            false,
+
+  "__kl_annealing__": "──────────────────────────────────────────",
+  "kl_anneal_portion": 0.3,
+  "kl_const_portion":  0.0001,
+  "kl_const_coeff":    0.0001,
+
+  "__flow__": "──────────────────────────────────────────",
+  "num_nf": 1,
+
+  "__latents__": "──────────────────────────────────────────",
+  "num_latent_scales":    1,
+  "num_groups_per_scale": 30,
+  "num_latent_per_group": 20,
+  "ada_groups":           false,
+  "min_groups_per_scale": 1,
+
+  "__encoder__": "──────────────────────────────────────────",
+  "num_channels_enc":      128,
+  "num_preprocess_blocks": 1,
+  "num_preprocess_cells":  2,
+  "num_cell_per_cond_enc": 2,
+
+  "__decoder__": "──────────────────────────────────────────",
+  "num_channels_dec":       128,
+  "num_postprocess_blocks": 1,
+  "num_postprocess_cells":  2,
+  "num_cell_per_cond_dec":  2,
+  "num_mixture_dec":        10,
+
+  "__nas__": "──────────────────────────────────────────",
+  "use_se":   true,
+  "res_dist": true,
+
+  "__distributed__": "──────────────────────────────────────────",
+  "num_proc_node":        1,
+  "node_rank":            0,
+  "local_rank":           0,
+  "global_rank":          0,
+  "num_process_per_node": 1,
+  "master_address":       "127.0.0.1",
+
+  "__runtime__": "──────────────────────────────────────────",
+  "testing_epoch": null,
+  "upload":        false
+}
