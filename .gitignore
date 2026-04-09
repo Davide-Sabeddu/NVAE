@@ -3,3 +3,4 @@ visualizations/
 .run/
 *.pyc
 *.pdf
+data/checkpoints/
